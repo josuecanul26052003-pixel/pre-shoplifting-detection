@@ -1,4 +1,7 @@
 dataset/
 reports/
-reports/
+config/
+notebooks/
 .env/
+src/__pycache__/
+*.pyc
