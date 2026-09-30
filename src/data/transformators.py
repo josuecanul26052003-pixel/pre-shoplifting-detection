@@ -3,15 +3,45 @@ from abc import abstractmethod
 import numpy as np
 import random
 from scipy.interpolate import interp1d
-from src.utils.helpers import compute_height_sample
 from typing import Any, List, Dict, Tuple, Union
 from typing import Optional
+
+def compute_height_sample(data, neck_idx, midhip_idx):
+    neck = data[:, neck_idx, :2]
+    midhip = data[:, midhip_idx, :2]
+    ds = np.linalg.norm(neck - midhip, axis=1)
+    return ds
 
 class Transformator(ABC):
     @abstractmethod
     def apply(self, data):
         pass
 
+class LowConfidenceCutter(Transformator):
+    def __init__(self, threshold: float, score_index: int = 2):
+        # Permito pasar el score_index por si el orden de los canales cambia a [score, x, y]
+        self.threshold = threshold
+        self.score_index = score_index 
+
+    def apply(self, data):
+        """
+        data: Arreglo de NumPy de forma (F, K, C)
+              F = Frames
+              K = Keypoints
+              C = Channels (x=0, y=1, score=2)
+        """
+        data_out = data.copy()
+        if not np.issubdtype(data_out.dtype, np.floating):
+            data_out = data_out.astype(float)
+        
+        frame_score_means = data[:, :, self.score_index].mean(axis=1)
+        
+        mask = frame_score_means < self.threshold
+        
+        data_out[mask, :, :] = np.nan
+        
+        return data_out
+        
 
 class Sampler(Transformator):
     def __init__(self, n_frames, strategy="uniform"):
@@ -24,7 +54,6 @@ class Sampler(Transformator):
         """
         self.n_frames = n_frames
         
-        # Validamos que la estrategia elegida sea correcta
         if strategy not in ["uniform", "last"]:
             raise ValueError("El parámetro 'strategy' debe ser 'uniform' o 'last'.")
         
@@ -42,12 +71,7 @@ class Sampler(Transformator):
             # Nueva estrategia: últimos n_frames
             # Nota: Si self.n_frames es mayor que F, simplemente devolverá todos los frames disponibles
             return data[-self.n_frames:, :, :]
-
-class MMactionFormater(Transformator):
-    
-    def apply(self, data):
-        return np.expand_dims(data, axis=0)
-
+        
 class TemporalJumpCutter(Transformator):
     def __init__(self, threshold: float):
         self.threshold = threshold
@@ -113,7 +137,6 @@ class TemporalJumpCutter(Transformator):
                         t += 1
                     else:
                         break
-
         return data
 
 class Interpolator(Transformator):
@@ -152,15 +175,9 @@ class Interpolator(Transformator):
 class VirtualKeypoint(Transformator):
     def __init__(
         self,
-        groups: List[List[int]],
-        remove_original: bool = False
+        groups: tuple[int, int],
+        remove_original: bool = False,
     ):
-        """
-        groups: lista de listas de índices
-            Ej: [[11,12], [5,6]] → generará 2 nuevos keypoints
-
-        remove_original: elimina los índices usados si es True
-        """
         self.groups = groups
         self.remove_original = remove_original
 
@@ -170,25 +187,20 @@ class VirtualKeypoint(Transformator):
         new_points = []
         used_idxs = set()
 
-        # Crear puntos virtuales
         for idxs in self.groups:
-            pts = data[:, idxs, :]  # (F, len(idxs), C)
+            pts = data[:, idxs, :]
 
-            # Promedio ignorando NaNs
-            mean_pt = np.nanmean(pts, axis=1)  # (F, C)
+            mean_pt = np.nanmean(pts, axis=1)
 
-            new_points.append(mean_pt[:, np.newaxis, :])  # (F, 1, C)
+            new_points.append(mean_pt[:, np.newaxis, :])
             used_idxs.update(idxs)
 
-        # Concatenar nuevos puntos al final
-        new_points = np.concatenate(new_points, axis=1)  # (F, N_new, C)
+        new_points = np.concatenate(new_points, axis=1) 
         data_out = np.concatenate([data, new_points], axis=1)
 
-        # Eliminar originales si aplica
         if self.remove_original:
             keep_idxs = [i for i in range(K) if i not in used_idxs]
 
-            # índices de los nuevos puntos (ya al final)
             new_idxs = list(range(K, K + len(self.groups)))
 
             data_out = data_out[:, keep_idxs + new_idxs, :]
@@ -219,16 +231,9 @@ class KeypointCutter(Transformator):
 
 class FrameNaNCutter(Transformator):
     def apply(self, data: np.ndarray) -> np.ndarray:
-        # Asegurar float por seguridad
         data = data.astype(float, copy=False)
-
-        # Detectar NaNs en cualquier canal de cualquier keypoint
-        # nan_mask shape: (F,)
         nan_mask = np.isnan(data).any(axis=(1, 2))
-
-        # Nos quedamos con frames que NO tienen NaNs
         valid_frames = ~nan_mask
-
         return data[valid_frames]
     
 
@@ -239,15 +244,20 @@ class ScoresCutter(Transformator):
 class SkeletonCentering(Transformator):
     def __init__(self, midhip_index=9):
         self.midhip_index=midhip_index
+
     def apply(self, data):
+        
         centered = data.copy()
         midhip = centered[:, self.midhip_index: self.midhip_index+1, :]
         centered = centered - midhip
+
         return centered
     
 class HeightScaler(Transformator):
 
-    def __init__(self, strategy: Optional[str] = None):
+    def __init__(self, strategy: Optional[str] = None, neck_idx=8, midhip_idx=9):
+        self.neck_idx = neck_idx
+        self.midhip_idx = midhip_idx
         self._set_strategy(strategy)
 
     def _set_strategy(self, strategy: Optional[str] = None):
@@ -258,19 +268,18 @@ class HeightScaler(Transformator):
 
     def _compute_scale(self, height: np.ndarray) -> float:
         if self.strategy is None:
-            # 🔹 por frame (vector)
-            return 1 / height  # (T,)
+            return 1 / height
         
         elif self.strategy == 'mean':
-            return 1 / np.mean(height)  # escalar
+            return 1 / np.mean(height)
         
         elif self.strategy == 'median':
-            return 1 / np.median(height)  # escalar
+            return 1 / np.median(height)
 
     def apply(self, data):
         result = data.copy()
 
-        height = compute_height_sample(result)  # (T,)
+        height = compute_height_sample(result, self.neck_idx, self.midhip_idx)  # (T,)
         scale = self._compute_scale(height)
 
         if isinstance(scale, np.ndarray):
@@ -305,23 +314,6 @@ class Rotator(Transformator):
         ])
         return np.dot(data, rotation_matrix.T)
     
-
-# class Rotator(Transformator):
-      
-#     def __init__(self, angle: int):
-#         self.angle = angle
-            
-#     def apply(self, data):
-        
-#         # angle = np.random.randint(low, high+1)
-#         theta = np.radians(self.angle)
-#         cos_val = np.cos(theta)
-#         sin_val = np.sin(theta)
-#         rotation_matrix = np.array([
-#             [cos_val, -sin_val],
-#             [sin_val,  cos_val]
-#         ])
-#         return np.dot(data, rotation_matrix.T)
     
   
 class Flipper(Transformator):
@@ -335,19 +327,15 @@ class Flipper(Transformator):
         self.axis = axis
         
     def apply(self, data):
-        # Aplicar con probabilidad p
         if random.random() > self.p:
             return data
         
-        # Definir la matriz de transformación según el eje
         if self.axis == 'horizontal':
-            # Invierte X, mantiene Y
             flip_matrix = np.array([
                 [-1,  0],
                 [ 0,  1]
             ])
         elif self.axis == 'vertical':
-            # Mantiene X, invierte Y
             flip_matrix = np.array([
                 [ 1,  0],
                 [ 0, -1]
@@ -358,12 +346,11 @@ class Flipper(Transformator):
         return np.dot(data, flip_matrix.T)
     
 class Pipeline:
-    def __init__(self, steps: List[Any]): # Reemplaza Any por Transformator si lo tienes importado
+    def __init__(self, steps: List[Any]):
         self.steps = steps
         
     def run(self, samples: Union[List[Dict], np.ndarray]) -> Union[List[Dict], np.ndarray]:
         
-        # CASO 1: Si la entrada es directamente un arreglo de NumPy
         if isinstance(samples, np.ndarray):
             output_data = samples.copy()
             
@@ -372,24 +359,20 @@ class Pipeline:
                 
             return output_data
             
-        # CASO 2: Si la entrada es una lista de diccionarios
         elif isinstance(samples, list):
-            # Copiamos la lista y los diccionarios internos para no mutar los originales
             output_samples = [sample.copy() for sample in samples]
             
             for sample in output_samples:
-                # Extraemos los keypoints del diccionario actual
                 data = sample['keypoints']
                 
-                # Pasamos los datos por cada paso del pipeline
                 for step in self.steps:
-                    data = step.apply(data)
-                    
-                # Reasignamos el resultado al diccionario
+                    try:
+                        data = step.apply(data)
+                    except Exception as e:
+                        print(f"Unexpected Error in {sample['source']} in the trasnformation {step.__class__}: {e}")
                 sample['keypoints'] = data
                 
             return output_samples
-            
-        # Manejo de errores por si se envía un tipo de dato no esperado
+        
         else:
             raise TypeError(f"El tipo de dato '{type(samples)}' no es soportado por el Pipeline.")

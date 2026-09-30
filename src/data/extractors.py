@@ -88,12 +88,9 @@ class AngleBetweenLimbsExtractor(FeatureExtractor):
         F: Frames
         L: Limbs
     '''
-    angle_triples =[
-        (0, 2, 4),
-        (1, 3, 5),
-        (2, 0, 6),
-        (3, 1, 7)
-    ]
+    def __init__(self, angle_triples):
+        self.angle_triples = angle_triples 
+        
 
     def compute_body_part_angle(self, limb_lens: np.ndarray):
         """
