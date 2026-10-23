@@ -17,6 +17,13 @@ class Transformator(ABC):
     def apply(self, data):
         pass
 
+    def apply_with_indices(self, data, indices):
+        """
+        Aplica la transformación y actualiza el arreglo de índices si es necesario.
+        Por defecto, devuelve los mismos índices.
+        """
+        return self.apply(data), indices
+
 class LowConfidenceCutter(Transformator):
     def __init__(self, threshold: float, score_index: int = 2):
         # Permito pasar el score_index por si el orden de los canales cambia a [score, x, y]
@@ -235,7 +242,11 @@ class FrameNaNCutter(Transformator):
         nan_mask = np.isnan(data).any(axis=(1, 2))
         valid_frames = ~nan_mask
         return data[valid_frames]
-    
+    def apply_with_indices(self, data: np.ndarray, indices: np.ndarray):
+        data_float = data.astype(float, copy=False)
+        nan_mask = np.isnan(data_float).any(axis=(1, 2))
+        valid_frames = ~nan_mask
+        return data[valid_frames], indices[valid_frames]
 
 class ScoresCutter(Transformator):
     def apply(self, data):
@@ -349,28 +360,34 @@ class Pipeline:
     def __init__(self, steps: List[Any]):
         self.steps = steps
         
-    def run(self, samples: Union[List[Dict], np.ndarray]) -> Union[List[Dict], np.ndarray]:
-        
+    def run(self, samples: Union[List[Dict], np.ndarray]) -> Union[List[Dict], np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         if isinstance(samples, np.ndarray):
             output_data = samples.copy()
+            # Inicializar los índices originales
+            indices = np.arange(output_data.shape[0])
             
             for step in self.steps:
-                output_data = step.apply(output_data)
+                output_data, indices = step.apply_with_indices(output_data, indices)
                 
-            return output_data
+            # Retorna tanto la data procesada como los índices sobrevivientes
+            return output_data, indices
             
         elif isinstance(samples, list):
             output_samples = [sample.copy() for sample in samples]
             
             for sample in output_samples:
                 data = sample['keypoints']
+                # Inicializar los índices originales para esta muestra
+                indices = np.arange(data.shape[0])
                 
                 for step in self.steps:
                     try:
-                        data = step.apply(data)
+                        data, indices = step.apply_with_indices(data, indices)
                     except Exception as e:
-                        print(f"Unexpected Error in {sample['source']} in the trasnformation {step.__class__}: {e}")
+                        print(f"Unexpected Error in {sample.get('source', 'Unknown')} in the transformation {step.__class__.__name__}: {e}")
+                
                 sample['keypoints'] = data
+                sample['frame_indices'] = indices
                 
             return output_samples
         
